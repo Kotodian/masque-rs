@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "tests/e2e/masque-e2e"]
+resolver = "3"
+
 [package]
 name = "masque"
 version = "0.1.0"

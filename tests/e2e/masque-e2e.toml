@@ -1,0 +1,13 @@
+[server]
+listen_addr = "0.0.0.0:4433"
+
+[tls]
+cert_path = "/certs/server.crt"
+key_path = "/certs/server.key"
+
+[udp_proxy]
+enabled = true
+deny_targets = ["127.0.0.0/8", "::1/128"]
+
+[ip_proxy]
+enabled = false

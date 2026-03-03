@@ -521,6 +521,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "masque-e2e"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "masque",
+ "quiche",
+ "ring",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
