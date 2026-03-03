@@ -44,7 +44,9 @@ impl Client {
         config.set_initial_max_data(10_000_000);
         config.set_initial_max_stream_data_bidi_local(1_000_000);
         config.set_initial_max_stream_data_bidi_remote(1_000_000);
+        config.set_initial_max_stream_data_uni(1_000_000);
         config.set_initial_max_streams_bidi(128);
+        config.set_initial_max_streams_uni(100);
         config.enable_dgram(true, 1000, 1000);
 
         let quic = quiche::connect(Some("server"), &scid, local, peer, &mut config)?;

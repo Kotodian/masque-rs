@@ -78,6 +78,7 @@ impl Server {
         quic_config.set_initial_max_data(10_000_000);
         quic_config.set_initial_max_stream_data_bidi_local(1_000_000);
         quic_config.set_initial_max_stream_data_bidi_remote(1_000_000);
+        quic_config.set_initial_max_stream_data_uni(1_000_000);
         quic_config.set_initial_max_streams_bidi(
             config.quic.initial_max_streams_bidi,
         );
@@ -406,8 +407,8 @@ impl Server {
             return;
         }
 
-        // Upgrade to HTTP/3 if not done yet.
-        if client.h3.is_none() {
+        // Upgrade to HTTP/3 once QUIC handshake completes.
+        if client.h3.is_none() && client.quic.is_established() {
             match quiche::h3::Connection::with_transport(
                 &mut client.quic,
                 &self.h3_config,
@@ -417,7 +418,7 @@ impl Server {
                     debug!("HTTP/3 connection established");
                 }
                 Err(e) => {
-                    debug!(%e, "HTTP/3 handshake not ready yet");
+                    warn!(%e, "failed to create HTTP/3 connection");
                 }
             }
         }

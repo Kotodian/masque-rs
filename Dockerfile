@@ -14,12 +14,13 @@ RUN mkdir -p src tests/e2e/masque-e2e/src \
     && echo "" > src/lib.rs \
     && echo "fn main() {}" > tests/e2e/masque-e2e/src/main.rs \
     && cargo build --release -p masque 2>/dev/null || true \
+    && rm -f target/release/masque target/release/deps/masque-* \
     && rm -rf src tests/e2e/masque-e2e/src
 
 # Copy real source and build.
 COPY src/ src/
 COPY tests/e2e/masque-e2e/ tests/e2e/masque-e2e/
-RUN cargo build --release -p masque
+RUN touch src/main.rs src/lib.rs && cargo build --release -p masque
 
 # Stage 2: minimal runtime
 FROM debian:bookworm-slim
