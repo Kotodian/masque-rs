@@ -1,7 +1,9 @@
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use masque::capsule::decoder::CapsuleDecoder;
+use masque::capsule::CapsuleFrame;
 use quiche::h3::NameValue;
 use ring::rand::SecureRandom;
 use tracing::{error, info, warn};
@@ -182,6 +184,64 @@ impl Client {
         self.quic.dgram_send(&encoded)?;
         self.flush()?;
         Ok(())
+    }
+
+    /// Drive the connection and collect capsules from the H3 body stream.
+    fn recv_capsules(
+        &mut self,
+        stream_id: u64,
+        timeout: Duration,
+    ) -> Result<Vec<CapsuleFrame>> {
+        let deadline = Instant::now() + timeout;
+        let mut decoder = CapsuleDecoder::new();
+        let mut frames = Vec::new();
+        let mut body_buf = [0u8; BUF_SIZE];
+
+        while Instant::now() < deadline {
+            // Poll + recv_body in a single scope to avoid borrow conflicts.
+            let mut got_data = true;
+            while got_data {
+                got_data = false;
+                let h3 = self.h3.as_mut().context("H3 not initialised")?;
+                match h3.poll(&mut self.quic) {
+                    Ok((sid, quiche::h3::Event::Data)) if sid == stream_id => {
+                        got_data = true;
+                    }
+                    Ok(_) => {
+                        got_data = true;
+                        continue;
+                    }
+                    Err(quiche::h3::Error::Done) => {}
+                    Err(e) => bail!("H3 poll: {e}"),
+                }
+
+                // Drain all available body data.
+                loop {
+                    let h3 = self.h3.as_mut().unwrap();
+                    match h3.recv_body(&mut self.quic, stream_id, &mut body_buf) {
+                        Ok(len) => {
+                            match decoder.decode(&body_buf[..len]) {
+                                Ok(mut capsules) => frames.append(&mut capsules),
+                                Err(masque::capsule::decoder::DecodeError::Incomplete) => {}
+                                Err(e) => bail!("capsule decode: {e:?}"),
+                            }
+                        }
+                        Err(quiche::h3::Error::Done) => break,
+                        Err(e) => bail!("recv_body: {e}"),
+                    }
+                }
+            }
+
+            if !frames.is_empty() {
+                return Ok(frames);
+            }
+            self.drive()?;
+        }
+
+        if frames.is_empty() {
+            bail!("capsule timeout — no capsules received");
+        }
+        Ok(frames)
     }
 
     /// Wait for a QUIC DATAGRAM and decode it as an HTTP Datagram.
@@ -371,6 +431,215 @@ fn test_non_connect_404(
 }
 
 // ---------------------------------------------------------------------------
+// CONNECT-IP helpers
+// ---------------------------------------------------------------------------
+
+fn connect_ip_headers(server_addr: &str) -> Vec<quiche::h3::Header> {
+    vec![
+        quiche::h3::Header::new(b":method", b"CONNECT"),
+        quiche::h3::Header::new(b":protocol", b"connect-ip"),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b":authority", server_addr.as_bytes()),
+        quiche::h3::Header::new(b":path", b"/.well-known/masque/ip/"),
+        quiche::h3::Header::new(b"capsule-protocol", b"?1"),
+    ]
+}
+
+fn ipv4_checksum(header: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 1 < header.len() {
+        // Skip the checksum field at bytes 10-11.
+        if i == 10 {
+            i += 2;
+            continue;
+        }
+        sum += u16::from_be_bytes([header[i], header[i + 1]]) as u32;
+        i += 2;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Build a minimal IPv4/UDP packet.
+fn build_udp_in_ipv4(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    sport: u16,
+    dport: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let udp_len: u16 = 8 + payload.len() as u16;
+    let total_len: u16 = 20 + udp_len;
+
+    // IPv4 header (20 bytes, no options).
+    let mut pkt = vec![0u8; 20];
+    pkt[0] = 0x45; // version=4, IHL=5
+    pkt[2..4].copy_from_slice(&total_len.to_be_bytes());
+    pkt[8] = 64; // TTL
+    pkt[9] = 17; // protocol = UDP
+    pkt[12..16].copy_from_slice(&src.octets());
+    pkt[16..20].copy_from_slice(&dst.octets());
+    let cksum = ipv4_checksum(&pkt);
+    pkt[10..12].copy_from_slice(&cksum.to_be_bytes());
+
+    // UDP header (8 bytes).
+    pkt.extend_from_slice(&sport.to_be_bytes());
+    pkt.extend_from_slice(&dport.to_be_bytes());
+    pkt.extend_from_slice(&udp_len.to_be_bytes());
+    pkt.extend_from_slice(&[0, 0]); // checksum = 0 (optional for IPv4)
+
+    // Payload.
+    pkt.extend_from_slice(payload);
+    pkt
+}
+
+// ---------------------------------------------------------------------------
+// CONNECT-IP tests
+// ---------------------------------------------------------------------------
+
+fn test_connect_ip_handshake(
+    server_addr: &str,
+    _echo_addr: &str,
+) -> Result<()> {
+    let mut client = Client::connect(server_addr)?;
+    client.handshake()?;
+    client.init_h3()?;
+
+    let headers = connect_ip_headers(server_addr);
+    let stream_id = client.send_request(&headers, false)?;
+
+    let (_sid, status) = client.poll_response(Duration::from_secs(5))?;
+    if status != 200 {
+        bail!("expected 200, got {status}");
+    }
+
+    // Read capsules (ADDRESS_ASSIGN + ROUTE_ADVERTISEMENT).
+    let capsules = client.recv_capsules(stream_id, Duration::from_secs(5))?;
+
+    let mut got_addr_assign = false;
+    let mut got_route_adv = false;
+
+    for frame in &capsules {
+        match frame {
+            CapsuleFrame::AddressAssign(addrs) => {
+                got_addr_assign = true;
+                // Must have at least one IPv4 address from 10.89.x.x pool.
+                let has_v4 = addrs.iter().any(|a| {
+                    matches!(&a.ip, masque::capsule::IpAddress::V4(v4) if v4.octets()[0] == 10 && v4.octets()[1] == 89)
+                });
+                if !has_v4 {
+                    bail!("ADDRESS_ASSIGN missing IPv4 from 10.89.x.x pool: {addrs:?}");
+                }
+                info!("ADDRESS_ASSIGN OK: {addrs:?}");
+            }
+            CapsuleFrame::RouteAdvertisement(routes) => {
+                got_route_adv = true;
+                if routes.is_empty() {
+                    bail!("ROUTE_ADVERTISEMENT has no routes");
+                }
+                info!("ROUTE_ADVERTISEMENT OK: {} routes", routes.len());
+            }
+            other => {
+                info!("unexpected capsule: {other:?}");
+            }
+        }
+    }
+
+    if !got_addr_assign {
+        bail!("missing ADDRESS_ASSIGN capsule");
+    }
+    if !got_route_adv {
+        bail!("missing ROUTE_ADVERTISEMENT capsule");
+    }
+
+    Ok(())
+}
+
+fn test_connect_ip_round_trip(
+    server_addr: &str,
+    echo_addr: &str,
+) -> Result<()> {
+    let mut client = Client::connect(server_addr)?;
+    client.handshake()?;
+    client.init_h3()?;
+
+    let headers = connect_ip_headers(server_addr);
+    let stream_id = client.send_request(&headers, false)?;
+
+    let (_sid, status) = client.poll_response(Duration::from_secs(5))?;
+    if status != 200 {
+        bail!("expected 200, got {status}");
+    }
+
+    // Read capsules to get the assigned IPv4 address.
+    let capsules = client.recv_capsules(stream_id, Duration::from_secs(5))?;
+
+    let assigned_v4 = capsules
+        .iter()
+        .find_map(|f| match f {
+            CapsuleFrame::AddressAssign(addrs) => addrs.iter().find_map(|a| match &a.ip {
+                masque::capsule::IpAddress::V4(v4) => Some(*v4),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .context("no IPv4 assigned")?;
+
+    info!(%assigned_v4, "assigned address");
+
+    // Parse echo server address.
+    let (echo_host, echo_port) = echo_addr
+        .rsplit_once(':')
+        .context("bad ECHO_SERVER_ADDR")?;
+    let echo_ip: Ipv4Addr = echo_host.parse().context("parse echo host")?;
+    let echo_port: u16 = echo_port.parse().context("parse echo port")?;
+
+    // Build a UDP-in-IPv4 packet and send as QUIC DATAGRAM.
+    let payload = b"connect-ip echo test";
+    let ip_pkt = build_udp_in_ipv4(assigned_v4, echo_ip, 12345, echo_port, payload);
+
+    // context_id=0 means raw IP packet in CONNECT-IP datagrams.
+    client.send_dgram(stream_id, &ip_pkt)?;
+
+    // Receive the response datagram.
+    let dgram = client.recv_dgram(Duration::from_secs(5))?;
+
+    // The response payload is an IP packet; parse the UDP payload out of it.
+    let resp = &dgram.payload;
+    if resp.len() < 28 {
+        bail!("response IP packet too short: {} bytes", resp.len());
+    }
+
+    let ihl = ((resp[0] & 0x0f) as usize) * 4;
+    if resp.len() < ihl + 8 {
+        bail!("response too short for UDP header");
+    }
+
+    // Verify destination IP is our assigned address.
+    let dst_ip = Ipv4Addr::new(resp[16], resp[17], resp[18], resp[19]);
+    if dst_ip != assigned_v4 {
+        bail!("response dst {dst_ip} != assigned {assigned_v4}");
+    }
+
+    // Extract UDP payload.
+    let udp_data_offset = ihl + 8;
+    let resp_payload = &resp[udp_data_offset..];
+    if resp_payload != payload {
+        bail!(
+            "payload mismatch: {:?} vs {:?}",
+            resp_payload,
+            payload.to_vec()
+        );
+    }
+
+    info!("CONNECT-IP round-trip OK");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -399,6 +668,8 @@ fn main() {
         ("connect_udp_policy_deny", test_connect_udp_policy_deny),
         ("connect_udp_bad_uri", test_connect_udp_bad_uri),
         ("non_connect_404", test_non_connect_404),
+        ("connect_ip_handshake", test_connect_ip_handshake),
+        ("connect_ip_round_trip", test_connect_ip_round_trip),
     ];
 
     let mut passed = 0u32;

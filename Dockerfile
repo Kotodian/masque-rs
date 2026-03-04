@@ -25,7 +25,7 @@ RUN touch src/main.rs src/lib.rs && cargo build --release -p masque
 # Stage 2: minimal runtime
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y ca-certificates iproute2 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ca-certificates iproute2 iptables && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/masque /usr/local/bin/masque
 
